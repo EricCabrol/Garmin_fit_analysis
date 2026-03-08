@@ -417,7 +417,73 @@ def run_kalman(records, dt=1.0):
 
 
 # ─────────────────────────────────────────────
-# 4.  HTML REPORT GENERATOR
+# 4.  HR MODEL  (OLS: HR = a + b·pace + c·t)
+# ─────────────────────────────────────────────
+
+def fit_hr_model(results, lag_s=40):
+    """
+    Fit HR = a + b*pace + c*t by OLS on the filtered Kalman data.
+    pace is in min/km (lagged by lag_s seconds), t in minutes.
+    Returns dict with coefficients, R², predictions, and scatter data.
+    """
+    hr   = np.array([r["heart_rate"] for r in results], dtype=float)
+    spd  = np.array([r["speed"]      for r in results], dtype=float)
+    n    = len(results)
+    t_min = np.arange(n) / 60.0   # elapsed time in minutes
+
+    pace = np.where(spd > 0.1, 1000.0 / (spd * 60.0), np.nan)
+
+    # Lag pace: HR responds to effort ~lag_s seconds after speed change
+    pace_lagged = np.empty(n)
+    pace_lagged[:lag_s] = pace[0]
+    pace_lagged[lag_s:]  = pace[:-lag_s]
+
+    valid = np.isfinite(pace_lagged) & np.isfinite(hr)
+    X = np.column_stack([np.ones(np.sum(valid)), pace_lagged[valid], t_min[valid]])
+    y = hr[valid]
+
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    a, b, c = float(beta[0]), float(beta[1]), float(beta[2])
+
+    hr_pred = np.full(n, np.nan)
+    hr_pred[valid] = a + b * pace_lagged[valid] + c * t_min[valid]
+
+    ss_res = float(np.sum((y - (a + b * pace_lagged[valid] + c * t_min[valid]))**2))
+    ss_tot = float(np.sum((y - float(np.mean(y)))**2))
+    r2     = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    rmse   = float(np.sqrt(ss_res / len(y)))
+
+    print(f"    HR model:  a={a:.2f}  b={b:.4f}  c={c:.4f}  R²={r2:.3f}  RMSE={rmse:.2f} bpm  lag={lag_s}s")
+
+    # Scatter data: one point per second for the HR-vs-pace plot
+    scatter = []
+    for i in range(n):
+        if valid[i]:
+            scatter.append({
+                "pace":    round(float(pace_lagged[i]), 4),
+                "hr":      round(float(hr[i]), 1),
+                "hr_pred": round(float(hr_pred[i]), 1),
+                "t_min":   round(float(t_min[i]), 2),
+            })
+
+    # Model curve: pace axis 4.0 → 7.0, evaluated at t = total_time/2
+    t_mid   = float(t_min[-1]) / 2.0
+    pace_ax = np.linspace(4.0, 7.0, 60)
+    hr_curve = a + b * pace_ax + c * t_mid
+
+    return {
+        "a": a, "b": b, "c": c,
+        "r2": r2, "rmse": rmse, "lag_s": lag_s,
+        "hr_pred":  [round(float(v), 1) if np.isfinite(v) else None for v in hr_pred],
+        "scatter":  scatter,
+        "curve_pace": pace_ax.tolist(),
+        "curve_hr":   hr_curve.tolist(),
+        "t_mid":    t_mid,
+    }
+
+
+# ─────────────────────────────────────────────
+# 5.  HTML REPORT GENERATOR
 # ─────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -614,6 +680,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="legend-item">
         <div class="legend-line" style="background:#fc8181;"></div>Filtered HR
+      </div>
+    </div>
+  </div>
+
+
+  <!-- HR MODEL CARD -->
+  <div class="card">
+    <div class="card-header">
+      <span>📈</span>
+      <h2>HR Model — HR = a + b·pace + c·t &nbsp;<span style="font-weight:400;font-size:0.85em;color:#718096">(lag {{hr_lag_s}}s)</span></h2>
+      <div class="badge">R² = {{hr_r2}} &nbsp;|&nbsp; RMSE = {{hr_rmse}} bpm</div>
+    </div>
+    <div style="padding:14px 24px 4px;color:#a0aec0;font-size:0.83rem;">
+      Model fitted on filtered data: &nbsp;
+      <code style="color:#63b3ed;">HR = {{hr_a}} + {{hr_b}} × pace + {{hr_c}} × t</code>
+      &nbsp;(pace in min/km, t in min)
+    </div>
+    <div class="chart-wrap" style="height:360px">
+      <canvas id="hrModelChart"></canvas>
+    </div>
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-line" style="background:#a78bfa;opacity:0.5;width:10px;height:10px;border-radius:50%;flex-shrink:0"></div>Measured HR (coloured by elapsed time)
+      </div>
+      <div class="legend-item">
+        <div class="legend-line" style="background:#f6e05e;"></div>Model HR = a + b·pace + c·t  (at mid-run time)
       </div>
     </div>
   </div>
@@ -815,6 +907,92 @@ const DATA = {{json_data}};
     }
   });
 })();
+
+// ── HR Model scatter plot ────────────────────────────────────
+(function() {
+  const MODEL = {{hr_model_json}};
+  if (!MODEL || !MODEL.scatter || MODEL.scatter.length === 0) return;
+
+  const ctx = document.getElementById('hrModelChart').getContext('2d');
+  const sc  = MODEL.scatter;
+  const tMax = sc[sc.length - 1].t_min;
+
+  // Colour each point by elapsed time (blue → red gradient)
+  const colours = sc.map(d => {
+    const f = d.t_min / tMax;
+    const r = Math.round(100 + 155 * f);
+    const g = Math.round(100 - 80 * f);
+    const b = Math.round(240 - 180 * f);
+    return `rgba(${r},${g},${b},0.55)`;
+  });
+
+  const fmtPace = v => {
+    if (v == null) return '—';
+    const m = Math.floor(v), s = Math.round((v - m) * 60);
+    return m + ':' + String(s).padStart(2, '0');
+  };
+
+  new Chart(ctx, {
+    data: {
+      datasets: [
+        // scatter: measured HR vs lagged pace
+        {
+          type: 'scatter',
+          label: 'Measured HR',
+          data: sc.map(d => ({ x: d.pace, y: d.hr })),
+          backgroundColor: colours,
+          pointRadius: 2.5,
+          pointHoverRadius: 4,
+          order: 2,
+        },
+        // model curve at mid-run time
+        {
+          type: 'line',
+          label: 'Model (mid-run)',
+          data: MODEL.curve_pace.map((p, i) => ({ x: p, y: MODEL.curve_hr[i] })),
+          borderColor: '#f6e05e',
+          backgroundColor: 'transparent',
+          borderWidth: 2.5,
+          pointRadius: 0,
+          tension: 0.3,
+          order: 1,
+        },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { labels: { color: '#a0aec0', font: { size: 12 } } },
+        tooltip: {
+          backgroundColor: '#1a2035', titleColor: '#e2e8f0', bodyColor: '#a0aec0',
+          callbacks: {
+            title: items => 'Pace: ' + fmtPace(items[0].parsed.x) + ' min/km',
+            label: item => item.datasetIndex === 0
+              ? `HR: ${Math.round(item.parsed.y)} bpm  (t=${sc[item.dataIndex]?.t_min?.toFixed(1)} min)`
+              : `Model: ${Math.round(item.parsed.y)} bpm`,
+          }
+        },
+        annotation: undefined,
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          min: 4.0, max: 7.0,
+          reverse: true,
+          ticks: { color: '#718096', callback: v => fmtPace(v) },
+          grid:  { color: '#2d3748' },
+          title: { display: true, text: 'Pace (min/km, lagged ' + MODEL.lag_s + 's)', color: '#718096' },
+        },
+        y: {
+          ticks: { color: '#fc8181' },
+          grid:  { color: '#2d3748' },
+          title: { display: true, text: 'Heart rate (bpm)', color: '#fc8181' },
+        },
+      }
+    }
+  });
+})();
+
 </script>
 </body>
 </html>
@@ -882,8 +1060,16 @@ def main():
     print(f"    Path roughness  raw={rough_raw:.4f} m  filtered={rough_filt:.4f} m")
     print(f"    Path noise reduction: {noise_red:.1f} %")
 
+    # ── HR model ───────────────────────────────────────────────
+    has_hr = any(r.get("heart_rate") is not None for r in results)
+    hr_model = {}
+    if has_hr:
+        print("[+] Fitting HR model …")
+        hr_model = fit_hr_model(results, lag_s=40)
+
     # ── Build HTML ─────────────────────────────────────────────
-    json_data = json.dumps(results, indent=None)
+    json_data      = json.dumps(results,  indent=None)
+    hr_model_json  = json.dumps(hr_model, indent=None)
 
     html = HTML_TEMPLATE \
         .replace("{{source_label}}",   source_label) \
@@ -893,6 +1079,13 @@ def main():
         .replace("{{std_filt}}",        f"{std_filt:.4f}") \
         .replace("{{roughness_raw}}",   f"{rough_raw:.3f}") \
         .replace("{{noise_reduction}}", f"{noise_red:.1f}") \
+        .replace("{{hr_lag_s}}",        str(hr_model.get("lag_s", 40))) \
+        .replace("{{hr_r2}}",           f"{hr_model.get('r2', 0):.3f}") \
+        .replace("{{hr_rmse}}",         f"{hr_model.get('rmse', 0):.2f}") \
+        .replace("{{hr_a}}",            f"{hr_model.get('a', 0):.2f}") \
+        .replace("{{hr_b}}",            f"{hr_model.get('b', 0):.4f}") \
+        .replace("{{hr_c}}",            f"{hr_model.get('c', 0):.4f}") \
+        .replace("{{hr_model_json}}",   hr_model_json) \
         .replace("{{json_data}}",       json_data)
 
     out_path = "./output/garmin_kalman_report.html"
