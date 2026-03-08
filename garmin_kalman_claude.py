@@ -139,9 +139,12 @@ def read_fit(path: str):
                 # field 6 = speed (mm/s -> m/s)
                 spd = field_data.get(6)
                 rec["speed"] = spd / 1000.0 if (spd is not None and spd != 0xFFFF) else None
-                # field 7 = heading/course (100 * degrees -> degrees)  [enhanced_speed=field 8]
+                # field 7 = heading/course (100 * degrees -> degrees)
                 hdg = field_data.get(7)
                 rec["heading"] = hdg / 100.0 if (hdg is not None and hdg != 0xFFFF) else None
+                # field 3 = heart_rate (bpm, uint8)
+                hr = field_data.get(3)
+                rec["heart_rate"] = int(hr) if (hr is not None and hr != 0xFF) else None
                 records.append(rec)
 
     return records
@@ -181,14 +184,21 @@ def generate_demo_data(n=600, seed=42):
     noise_lat = rng.normal(0, 4.0, n) / 111320.0
     noise_lon = rng.normal(0, 4.0, n) / (111320.0 * math.cos(math.radians(lat0)))
 
+    noise_hr  = rng.normal(0, 2.0, n)
+    noise_cad = rng.normal(0, 2.0, n)
+    true_hr   = 145 + 5 * np.sin(2 * np.pi * t / 400)
+    true_cad  = 170 + 3 * np.sin(2 * np.pi * t / 200)
+
     records = []
     for i in range(n):
         records.append({
-            "timestamp": i,
-            "lat":     lats[i] + noise_lat[i],
-            "lon":     lons[i] + noise_lon[i],
-            "speed":   max(0.0, true_speed[i] + noise_spd[i]),
-            "heading": np.mod(true_heading[i] + noise_hdg[i], 360.0),
+            "timestamp":  i,
+            "lat":        lats[i] + noise_lat[i],
+            "lon":        lons[i] + noise_lon[i],
+            "speed":      max(0.0, true_speed[i] + noise_spd[i]),
+            "heading":    np.mod(true_heading[i] + noise_hdg[i], 360.0),
+            "heart_rate": int(np.clip(true_hr[i]  + noise_hr[i],  60, 220)),
+            "cadence":    int(np.clip(true_cad[i] + noise_cad[i], 60, 220)),
         })
     return records
 
@@ -292,39 +302,36 @@ def run_kalman(records, dt=1.0):
              for k in ("lat", "lon", "speed", "heading"))]
     if len(valid) < 5:
         raise ValueError("Not enough valid GPS records with speed+heading data.")
+    has_hr = any(r.get("heart_rate") is not None for r in valid)
 
-    # ── Q — Process noise covariance ──────────────────────────
+    # ── Q — Process noise covariance  (6×6 diagonal) ─────────
+    # State: [lat, lon, speed, heading, heart_rate, cadence]
     # Models allowed TRUE state change per 1-second step for a runner.
-    # Set Q < R to get smoothing, but not so small that the filter ignores GPS.
-    # Target Kalman gain K ≈ 0.15 for position (gentle smoothing of a clean GPS),
-    # K ≈ 0.10 for speed (Garmin sensor is already very clean),
-    # K ≈ 0.20 for heading (noisier, derived from position differences).
     #
-    # Q[0,0]=Q[1,1]: position process noise — 0.21 m/step (physical running jitter)
-    # Q[2,2]:        speed process noise    — 0.02 m/s per step (smooth pace)
-    # Q[3,3]:        heading process noise  — 2° per step (gradual turns)
-    σ_pos_proc = 0.21 / R_EARTH      # → K ≈ 0.15  (R_pos = 0.5 m / R_EARTH)
-    σ_spd_proc = 0.020               # → K ≈ 0.09  (R_spd = 0.064 m/s)
-    σ_hdg_proc = math.radians(2.0)   # → K ≈ 0.20  (R_hdg = 10°)
+    # Q[0,0]=Q[1,1]: position    — 0.21 m/step
+    # Q[2,2]:        speed       — 0.02 m/s per step
+    # Q[3,3]:        heading     — 2° per step
+    # Q[4,4]:        heart_rate  — 1 bpm per step  (HR changes slowly)
+    # Q[5,5]:        cadence     — 1 rpm per step  (cadence changes slowly)
+    σ_pos_proc = 0.21 / R_EARTH
+    σ_spd_proc = 0.020
+    σ_hdg_proc = math.radians(2.0)
+    σ_hr_proc  = 1.0    # 1 bpm / step
 
-    Q = np.diag([σ_pos_proc**2,
-                 σ_pos_proc**2,
-                 σ_spd_proc**2,
-                 σ_hdg_proc**2])
+    Q = np.diag([σ_pos_proc**2, σ_pos_proc**2, σ_spd_proc**2,
+                 σ_hdg_proc**2, σ_hr_proc**2])
 
-    # ── R — Observation (measurement) noise covariance ────────
-    # Calibrated from the actual FIT file using median-filter residuals:
-    #   GPS position noise ≈ 0.5 m  (this Garmin has excellent GNSS)
-    #   Speed sensor noise ≈ 0.064 m/s (Doppler / accelerometer-fused)
-    #   Heading (GPS-derived from consecutive fixes) ≈ 10°
-    σ_pos_obs = 0.5 / R_EARTH        # 0.5 m — measured from data residuals
-    σ_spd_obs = 0.064                 # 0.064 m/s — measured std of sensor
-    σ_hdg_obs = math.radians(10.0)   # 10° — typical GPS-heading noise at running speed
+    # ── R — Observation noise covariance  (5×5 diagonal) ─────
+    # Calibrated from the actual FIT file:
+    #   GPS position ≈ 0.5 m,  speed ≈ 0.064 m/s,  heading ≈ 10°
+    #   Heart rate optical sensor ≈ 2 bpm (1-σ)
+    σ_pos_obs = 0.5 / R_EARTH
+    σ_spd_obs = 0.064
+    σ_hdg_obs = math.radians(10.0)
+    σ_hr_obs  = 2.0    # 2 bpm optical sensor noise
 
-    R_obs = np.diag([σ_pos_obs**2,
-                     σ_pos_obs**2,
-                     σ_spd_obs**2,
-                     σ_hdg_obs**2])
+    R_obs = np.diag([σ_pos_obs**2, σ_pos_obs**2, σ_spd_obs**2,
+                     σ_hdg_obs**2, σ_hr_obs**2])
 
     # ── Initialise ──────────────────────────────────────────
     r0 = valid[0]
@@ -333,12 +340,14 @@ def run_kalman(records, dt=1.0):
         math.radians(r0["lon"]),
         r0["speed"],
         math.radians(r0["heading"]),
+        float(r0.get("heart_rate") or 140),
     ])
     P = np.diag([
         (10.0/R_EARTH)**2,
         (10.0/R_EARTH)**2,
         1.0**2,
         np.radians(20.0)**2,
+        5.0**2,
     ])
 
     results = []
@@ -348,38 +357,34 @@ def run_kalman(records, dt=1.0):
         lon_r = math.radians(r["lon"])
         spd_r = r["speed"]
         hdg_r = math.radians(r["heading"])
+        hr_r = float(r.get("heart_rate") or x[4])
 
         # ── PREDICT ─────────────────────────────────────────
-        lat, lon, spd, hdg = x
+        lat, lon, spd, hdg, hr = x
         cos_lat = math.cos(lat)
 
-        # Non-linear state transition
+        # Non-linear state transition (HR: constant model)
         new_lat = lat + spd * dt * math.cos(hdg) / R_EARTH
         new_lon = lon + spd * dt * math.sin(hdg) / (R_EARTH * cos_lat)
         new_spd = spd
         new_hdg = hdg
+        new_hr  = hr
 
-        x_pred = np.array([new_lat, new_lon, new_spd, new_hdg])
+        x_pred = np.array([new_lat, new_lon, new_spd, new_hdg, new_hr])
 
-        # Jacobian of f w.r.t. x
-        F = np.eye(4)
-        # d(new_lat)/d(spd) = dt*cos(hdg)/R
+        # Jacobian of f w.r.t. x (5×5; HR row/col is identity)
+        F = np.eye(5)
         F[0, 2] = dt * math.cos(hdg) / R_EARTH
-        # d(new_lat)/d(hdg) = -spd*dt*sin(hdg)/R
         F[0, 3] = -spd * dt * math.sin(hdg) / R_EARTH
-        # d(new_lon)/d(lat) = spd*dt*sin(hdg)*sin(lat)/(R*cos²(lat))
         F[1, 0] = spd * dt * math.sin(hdg) * math.sin(lat) / (R_EARTH * cos_lat**2)
-        # d(new_lon)/d(spd)
         F[1, 2] = dt * math.sin(hdg) / (R_EARTH * cos_lat)
-        # d(new_lon)/d(hdg)
         F[1, 3] = spd * dt * math.cos(hdg) / (R_EARTH * cos_lat)
 
         P_pred = F @ P @ F.T + Q
 
         # ── UPDATE ──────────────────────────────────────────
-        # Observation model H = I (direct measurement)
-        H = np.eye(4)
-        z = np.array([lat_r, lon_r, spd_r, hdg_r])
+        H = np.eye(5)
+        z = np.array([lat_r, lon_r, spd_r, hdg_r, hr_r])
 
         # Innovation (handle heading wrap-around)
         y = z - x_pred
@@ -390,19 +395,22 @@ def run_kalman(records, dt=1.0):
         K = P_pred @ H.T @ np.linalg.inv(S)
         x = x_pred + K @ y
         x[3] = math.radians(wrap_heading(math.degrees(x[3])))
-        P = (np.eye(4) - K @ H) @ P_pred
+        x[4] = float(np.clip(x[4], 30, 250))   # guard HR
+        P = (np.eye(5) - K @ H) @ P_pred
 
         results.append({
-            "timestamp": r["timestamp"],
-            "lat":      math.degrees(x[0]),
-            "lon":      math.degrees(x[1]),
-            "speed":    float(x[2]),
-            "heading":  math.degrees(x[3]),
+            "timestamp":  r["timestamp"],
+            "lat":        math.degrees(x[0]),
+            "lon":        math.degrees(x[1]),
+            "speed":      float(x[2]),
+            "heading":    math.degrees(x[3]),
+            "heart_rate": float(x[4]),
             # raw
-            "raw_lat":     r["lat"],
-            "raw_lon":     r["lon"],
-            "raw_speed":   r["speed"],
-            "raw_heading": r["heading"],
+            "raw_lat":        r["lat"],
+            "raw_lon":        r["lon"],
+            "raw_speed":      r["speed"],
+            "raw_heading":    r["heading"],
+            "raw_heart_rate": r.get("heart_rate"),
         })
 
     return results
@@ -590,6 +598,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- HR CHART -->
+  <div class="card">
+    <div class="card-header">
+      <span>❤️</span>
+      <h2>Heart Rate — Raw vs Kalman Filtered</h2>
+      <div class="badge">EKF constant model</div>
+    </div>
+    <div class="chart-wrap" style="height:300px">
+      <canvas id="hrChart"></canvas>
+    </div>
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-line" style="background:#fc8181;opacity:0.55;"></div>Raw HR
+      </div>
+      <div class="legend-item">
+        <div class="legend-line" style="background:#fc8181;"></div>Filtered HR
+      </div>
+    </div>
+  </div>
+
   <!-- MAP -->
   <div class="card">
     <div class="card-header">
@@ -679,8 +707,8 @@ const DATA = {{json_data}};
         },
         y: {
           reverse: true,
-          min: 4.0,   // 4:00 min/km  (fast end, displayed at top)
-          max: 7.0,   // 7:00 min/km  (slow end, displayed at bottom)          
+          min: 4.0,
+          max: 7.0,
           ticks: {
             color: '#718096',
             callback: v => fmtPace(v),
@@ -731,6 +759,62 @@ const DATA = {{json_data}};
   const allPoints = rawPath.concat(filtPath);
   map.fitBounds(L.latLngBounds(allPoints).pad(0.05));
 })();
+// ── HR Chart ─────────────────────────────────────────────────
+(function() {
+  const labels = DATA.map((_, i) => i);
+  const hasHR = DATA.some(d => d.raw_heart_rate !== null && d.raw_heart_rate !== undefined);
+  if (!hasHR) return;
+  const ctx = document.getElementById('hrChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Raw HR (bpm)',
+          data: DATA.map(d => d.raw_heart_rate),
+          borderColor: 'rgba(252,129,129,0.45)',
+          backgroundColor: 'transparent',
+          borderWidth: 1.2, pointRadius: 0, tension: 0.1,
+        },
+        {
+          label: 'Filtered HR (bpm)',
+          data: DATA.map(d => d.heart_rate),
+          borderColor: '#fc8181',
+          backgroundColor: 'rgba(252,129,129,0.07)',
+          borderWidth: 2.2, pointRadius: 0, tension: 0.4,
+          fill: true,
+        },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#a0aec0', font: { size: 12 } } },
+        tooltip: {
+          backgroundColor: '#1a2035', titleColor: '#e2e8f0', bodyColor: '#a0aec0',
+          callbacks: {
+            title: items => 'T = ' + items[0].label + ' s',
+            label: ctx => ctx.dataset.label + ': ' + Math.round(ctx.parsed.y) + ' bpm',
+          }
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: '#718096', maxTicksLimit: 12, callback: v => v + 's' },
+          grid: { color: '#2d3748' },
+          title: { display: true, text: 'Time (s)', color: '#718096' }
+        },
+        y: {
+          ticks: { color: '#fc8181' },
+          grid: { color: '#2d3748' },
+          title: { display: true, text: 'Heart rate (bpm)', color: '#fc8181' },
+        },
+      }
+    }
+  });
+})();
 </script>
 </body>
 </html>
@@ -745,26 +829,25 @@ def main():
     fit_path = sys.argv[1] if len(sys.argv) > 1 else None
 
     # ── Load data ──────────────────────────────────────────────
-    if fit_path:
-        print(f"[+] Parsing FIT file: {fit_path}")
-        records = read_fit(fit_path)
-        # Fill missing speed/heading via GPS derivative if needed
-        records = [r for r in records if r.get("lat") and r.get("lon")]
-        print(f"    → {len(records)} GPS records found")
-        source_label = os.path.basename(fit_path)
+    if not fit_path:
+        print("Error: no FIT file provided.")
+        print("Usage: python garmin_kalman.py <activity.fit>")
+        sys.exit(1)
 
-        # Fill missing speed from GPS positions (heading is always derived inside run_kalman)
-        for i in range(1, len(records)):
-            a, b = records[i-1], records[i]
-            if b["speed"] is None:
-                dlat = math.radians(b["lat"] - a["lat"])
-                dlon = math.radians(b["lon"] - a["lon"])
-                dist = R_EARTH * math.sqrt(dlat**2 + (dlon * math.cos(math.radians(a["lat"])))**2)
-                b["speed"] = dist  # dt = 1 s
-    else:
-        print("[!] No FIT file provided – using synthetic demo data.")
-        records = generate_demo_data()
-        source_label = "synthetic demo data"
+    print(f"[+] Parsing FIT file: {fit_path}")
+    records = read_fit(fit_path)
+    records = [r for r in records if r.get("lat") and r.get("lon")]
+    print(f"    → {len(records)} GPS records found")
+    source_label = os.path.basename(fit_path)
+
+    # Fill missing speed from GPS positions (heading derived inside run_kalman)
+    for i in range(1, len(records)):
+        a, b = records[i-1], records[i]
+        if b["speed"] is None:
+            dlat = math.radians(b["lat"] - a["lat"])
+            dlon = math.radians(b["lon"] - a["lon"])
+            dist = R_EARTH * math.sqrt(dlat**2 + (dlon * math.cos(math.radians(a["lat"])))**2)
+            b["speed"] = dist  # dt = 1 s
 
     # ── Kalman filter ──────────────────────────────────────────
     print("[+] Running Extended Kalman Filter …")
